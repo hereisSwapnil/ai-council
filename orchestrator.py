@@ -53,6 +53,17 @@ class Orchestrator:
             return response.get("choices", [{}])[0].get("message", {}).get("content", "")
         return response.get("message", {}).get("content", "")
 
+    def _extract_error(self, response: dict) -> str:
+        """Extract error message from response if present."""
+        if not response:
+            return "Empty response"
+        if "error" in response:
+            error = response["error"]
+            if isinstance(error, dict):
+                return error.get("message", str(error))
+            return str(error)
+        return None
+
     def _get_member_response(
         self, 
         member: Model, 
@@ -65,16 +76,36 @@ class Orchestrator:
             start_time = time.time()
             
             response = member.generate(messages)
-            content = self._extract_content(response)
             
+            # Debug logging
+            import json
+            try:
+                logger.debug(f"{member_name} raw response: {json.dumps(response)}")
+            except:
+                logger.debug(f"{member_name} raw response: {response}")
+
+            content = self._extract_content(response)
+            error_msg = None
+            
+            if not content:
+                # Try to extract error from response
+                api_error = self._extract_error(response)
+                if api_error:
+                    error_msg = f"API Error: {api_error}"
+                    logger.warning(f"{member_name} API Error: {api_error}")
+                else:
+                    logger.warning(f"{member_name} produced empty content. Raw response: {response}")
+                    error_msg = "Empty response received from API"
+
             elapsed = time.time() - start_time
             logger.info(f"{member_name} completed in {elapsed:.2f}s")
             
-            return content, None
+            return content, error_msg
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"{member_name} failed: {error_msg}", exc_info=True)
             return None, error_msg
+
 
     def _format_discussion_history(self, up_to_round: int = None) -> str:
         """Format discussion history for context."""
@@ -116,9 +147,12 @@ class Orchestrator:
                 return True
         return False
 
-    def _run_discussion_round(self, round_number: int, query: str):
+    def _run_discussion_round(self, round_number: int, query: str, on_progress: callable = None):
         """Execute a single discussion round with all members."""
         logger.info(f"Starting Round {round_number}")
+        
+        if on_progress:
+            on_progress({"type": "round_start", "round_number": round_number})
         
         print(f"\n{'='*80}")
         print(f"ROUND {round_number}")
@@ -153,6 +187,7 @@ class Orchestrator:
         round_responses: List[Dict] = []
         start_time = time.time()
         
+        # We need to process results as they come in for the UI
         with ThreadPoolExecutor(max_workers=len(self.council_members)) as executor:
             future_to_member = {
                 executor.submit(
@@ -164,19 +199,33 @@ class Orchestrator:
                 for idx, member in enumerate(self.council_members)
             }
             
+            # Since we want ordered results for the history/print but potentially realtime 
+            # updates for UI, we can emit events as they complete, but store them 
+            # and sort later for the history.
+            
             results = []
             for future in as_completed(future_to_member):
                 _, name, idx = future_to_member[future]
                 content, error = future.result()
+                
+                # Emit real-time event
+                if on_progress:
+                    on_progress({
+                        "type": "member_response",
+                        "name": name,
+                        "content": content,
+                        "error": error
+                    })
+                
                 results.append((idx, name, content, error))
             
-            # Sort by original index to keep member ordering
+            # Sort by original index to keep member ordering in standard output/history
             results.sort(key=lambda x: x[0])
         
         elapsed = time.time() - start_time
         logger.info(f"Round {round_number} completed in {elapsed:.2f}s")
         
-        # Display and store responses
+        # Display and store responses (for history)
         for idx, name, content, error in results:
             print(f"{'─'*80}")
             print(f"{name}:")
@@ -211,9 +260,12 @@ class Orchestrator:
         # Return False if no successful responses, True otherwise
         return len(round_responses) > 0
 
-    def _get_head_decision(self, query: str):
+    def _get_head_decision(self, query: str, on_progress: callable = None):
         """Get final decision from council head based on full discussion."""
         logger.info("Council head making final decision...")
+        
+        if on_progress:
+            on_progress({"type": "head_decision_start"})
         
         print(f"\n{'='*80}")
         print("🎯 COUNCIL HEAD FINAL DECISION")
@@ -243,7 +295,25 @@ class Orchestrator:
         try:
             start_time = time.time()
             response = self.council_head.generate(messages)
+            
+            # Debug logging
+            import json
+            try:
+                logger.debug(f"Head raw response: {json.dumps(response)}")
+            except:
+                logger.debug(f"Head raw response: {response}")
+
             content = self._extract_content(response)
+            
+            if not content:
+                api_error = self._extract_error(response)
+                if api_error:
+                    logger.warning(f"Head API Error: {api_error}")
+                    content = f"⚠️ Could not generate decision. API Error: {api_error}"
+                else:
+                    logger.warning(f"Head produced empty content. Raw response: {response}")
+                    content = "⚠️ Could not generate decision. Received empty response from API."
+
             elapsed = time.time() - start_time
             
             logger.info(f"Head decision completed in {elapsed:.2f}s")
@@ -251,13 +321,19 @@ class Orchestrator:
             print(content)
             print(f"\n{'='*80}\n")
             
+            if on_progress:
+                on_progress({
+                    "type": "head_decision_complete",
+                    "content": content
+                })
+            
             return content
         except Exception as e:
             logger.error(f"Head decision failed: {str(e)}", exc_info=True)
             print(f"❌ Error: Council head failed to make decision: {str(e)}")
             return None
 
-    def run_discussion(self, query: str) -> dict:
+    def run_discussion(self, query: str, on_progress: callable = None) -> dict:
         """
         Run full autonomous discussion with multiple rounds and final decision.
         
@@ -271,6 +347,7 @@ class Orchestrator:
         
         Args:
             query: The topic or question for discussion
+            on_progress: Optional callback function(event_dict) for real-time updates
             
         Returns:
             dict with:
@@ -298,7 +375,7 @@ class Orchestrator:
         
         # Run discussion rounds
         for round_num in range(1, self.num_rounds + 1):
-            result = self._run_discussion_round(round_num, query)
+            result = self._run_discussion_round(round_num, query, on_progress)
             rounds_executed = round_num
 
             if result == "EARLY_STOP":
@@ -310,7 +387,7 @@ class Orchestrator:
                 logger.warning(f"Round {round_num} had no successful responses")
 
         # Get final decision from head
-        final_decision = self._get_head_decision(query)
+        final_decision = self._get_head_decision(query, on_progress)
         
         result = {
             "query": query,
